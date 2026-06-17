@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"oletext"
+	"github.com/doracpphp/oletext"
 )
 
 func main() {
