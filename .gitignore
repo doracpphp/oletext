@@ -1,2 +1,6 @@
 oletext.exe
-testdata/
+
+# Test fixtures are large and regenerable; keep them out of the repo but
+# commit the script that builds them (see testdata/gen.py).
+testdata/*
+!testdata/gen.py

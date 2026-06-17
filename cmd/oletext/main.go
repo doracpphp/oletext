@@ -1,5 +1,6 @@
-// Command oletext extracts text from legacy Office binary files
-// (.doc, .xls, .ppt) and writes it to standard output as UTF-8.
+// Command oletext extracts text from Microsoft Office documents
+// (.doc, .xls, .ppt and .docx, .xlsx, .pptx) and writes it to standard
+// output as UTF-8.
 package main
 
 import (
@@ -12,7 +13,7 @@ import (
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: oletext <file.doc|file.xls|file.ppt> ...")
+		fmt.Fprintln(os.Stderr, "usage: oletext <file.doc|.xls|.ppt|.docx|.xlsx|.pptx> ...")
 		os.Exit(2)
 	}
 	exitCode := 0

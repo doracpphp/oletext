@@ -5,6 +5,14 @@
 //     recVer==0xF marks a container record)
 //   - 2.9.46 TextCharsAtom (0x0FA0, UTF-16LE)
 //   - 2.9.45 TextBytesAtom (0x0FA8, low bytes of UTF-16 characters)
+//
+// Shape text (text boxes, placeholders, table cells and grouped shapes)
+// lives in the drawing layer: 2.5.10 PPDrawing -> [MS-ODRAW] OfficeArt
+// drawing/group/shape containers (recType 0xF002/0xF003/0xF004) ->
+// 2.9.76 OfficeArtClientTextbox (0xF00D) -> TextCharsAtom/TextBytesAtom.
+// Every link in that chain is an OfficeArt container (recVer==0xF), so the
+// recursive walk in walkPptRecords descends into it and collects the shape
+// text the same way it collects ordinary slide text.
 
 package oletext
 
