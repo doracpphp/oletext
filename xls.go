@@ -7,6 +7,18 @@
 //   - 2.5.293 XLUnicodeRichExtendedString, 2.5.294 XLUnicodeString
 //   - 2.4.149 LabelSst, 2.4.148 Label, 2.4.180 Number, 2.4.220 RK,
 //     2.4.175 MulRk, 2.4.127 Formula, 2.4.268 String, 2.4.28 BoundSheet8
+//   - 2.4.324 TxO (text of shapes, text boxes and cell comments; the text
+//     itself is stored in the Continue records that follow the TxO)
+//
+// A workbook also holds text outside the cell grid and the drawing layer.
+// These records are extracted too:
+//   - 2.4.137 Header / 2.4.136 Footer (page header/footer text, carrying
+//     page-setup format codes that stripHeaderFooterCodes removes)
+//   - 2.4.150 Lbl (defined names / named ranges)
+//   - 2.4.252 SeriesText (chart titles, axis titles and series names, found
+//     in the chart substreams)
+//   - 2.4.323 HLink (hyperlink display text and target URL; the payload is
+//     a Hyperlink object, [MS-OSHARED] 2.3.7.1)
 
 package oletext
 
@@ -25,6 +37,9 @@ import (
 const (
 	recFormula    = 0x0006
 	recEOF        = 0x000A
+	recHeader     = 0x0014
+	recFooter     = 0x0015
+	recLbl        = 0x0018
 	recContinue   = 0x003C
 	recBoundSheet = 0x0085
 	recMulRk      = 0x00BD
@@ -37,6 +52,9 @@ const (
 	recRK         = 0x027E
 	recBOF        = 0x0809
 	recFilePass   = 0x002F
+	recTxO        = 0x01B6
+	recHLink      = 0x01B8
+	recSeriesText = 0x100D
 )
 
 // biffRecord is one BIFF record: a 2-byte type, 2-byte size and payload.
@@ -61,7 +79,7 @@ func extractXls(f *cfbFile) (string, error) {
 		return "", errors.New("no BIFF records found")
 	}
 
-	x := &xlsExtractor{curRow: -1, sheetIdx: -1}
+	x := &xlsExtractor{curRow: -1, sheetIdx: -1, atLineStart: true}
 	for i := 0; i < len(recs); i++ {
 		r := recs[i]
 		switch r.typ {
@@ -69,6 +87,8 @@ func extractXls(f *cfbFile) (string, error) {
 			return "", errors.New("workbook is encrypted (FilePass)")
 		case recBOF:
 			x.onBOF(r.data)
+		case recEOF:
+			x.onEOF()
 		case recBoundSheet:
 			x.onBoundSheet(r.data)
 		case recSST:
@@ -93,6 +113,22 @@ func extractXls(f *cfbFile) (string, error) {
 			x.onFormula(r.data)
 		case recString:
 			x.onString(r.data)
+		case recTxO:
+			// The shape/textbox/comment text follows in Continue records.
+			var segs [][]byte
+			for i+1 < len(recs) && recs[i+1].typ == recContinue {
+				i++
+				segs = append(segs, recs[i].data)
+			}
+			x.onTxO(r.data, segs)
+		case recHeader, recFooter:
+			x.onHeaderFooter(r.data)
+		case recLbl:
+			x.onLbl(r.data)
+		case recSeriesText:
+			x.onSeriesText(r.data)
+		case recHLink:
+			x.onHLink(r.data)
 		}
 	}
 	out := x.out.String()
@@ -132,6 +168,13 @@ type xlsExtractor struct {
 	sheetIdx int
 	curRow   int
 	biff5    bool
+	// bofDepth is the current BOF/EOF substream nesting depth. Top-level
+	// sheet substreams sit at depth 1; an embedded chart's substream is
+	// nested deeper and must not be mistaken for a new sheet.
+	bofDepth int
+	// atLineStart is true when the output buffer is empty or ends with a
+	// newline, so the next cell or shape knows whether to start a new line.
+	atLineStart bool
 	// A formula whose cached result is a string: the next String record
 	// belongs to this cell.
 	pendingStringRow int
@@ -141,6 +184,7 @@ type xlsExtractor struct {
 // onBOF handles a BOF record: it detects the BIFF version on the workbook
 // globals substream and starts a new sheet section on worksheet substreams.
 func (x *xlsExtractor) onBOF(d []byte) {
+	x.bofDepth++
 	if len(d) < 4 {
 		return
 	}
@@ -150,7 +194,14 @@ func (x *xlsExtractor) onBOF(d []byte) {
 		x.biff5 = vers != 0x0600
 		return
 	}
-	// Substreams (worksheet/chart/macro) appear in BoundSheet8 order.
+	if x.bofDepth != 1 {
+		// A nested substream, e.g. an embedded chart inside a worksheet.
+		// Its records belong to the enclosing sheet, so do not start a new
+		// sheet section here.
+		return
+	}
+	// Top-level sheet substreams (worksheet/chart/macro) appear in
+	// BoundSheet8 order.
 	x.sheetIdx++
 	x.curRow = -1
 	if dt == 0x0010 { // worksheet
@@ -158,10 +209,17 @@ func (x *xlsExtractor) onBOF(d []byte) {
 		if x.sheetIdx < len(x.sheets) {
 			name = x.sheets[x.sheetIdx]
 		}
-		if x.out.Len() > 0 {
-			x.out.WriteByte('\n')
-		}
+		x.newline()
 		fmt.Fprintf(&x.out, "=== Sheet: %s ===\n", name)
+		x.atLineStart = true
+	}
+}
+
+// onEOF closes the current substream, unwinding the nesting tracked by
+// onBOF so that the next top-level BOF is recognized as a new sheet.
+func (x *xlsExtractor) onEOF() {
+	if x.bofDepth > 0 {
+		x.bofDepth--
 	}
 }
 
@@ -319,15 +377,314 @@ func (x *xlsExtractor) emitCell(row int, text string) {
 	if text == "" {
 		return
 	}
-	if x.curRow >= 0 {
-		if row == x.curRow {
-			x.out.WriteByte('\t')
-		} else {
-			x.out.WriteByte('\n')
+	if row == x.curRow && !x.atLineStart {
+		x.out.WriteByte('\t')
+	} else {
+		x.newline()
+	}
+	x.out.WriteString(text)
+	x.atLineStart = false
+	x.curRow = row
+}
+
+// newline starts a fresh output line unless the buffer is already at one.
+func (x *xlsExtractor) newline() {
+	if !x.atLineStart {
+		x.out.WriteByte('\n')
+		x.atLineStart = true
+	}
+}
+
+// onTxO emits the text of a TxO record ([MS-XLS] 2.4.324): a shape, text
+// box or cell comment. The fixed part gives cchText at offset 10; the
+// characters live in the Continue records in segs, each of which begins
+// with a fresh fHighByte flag byte ([MS-XLS] 2.5.293).
+func (x *xlsExtractor) onTxO(d []byte, segs [][]byte) {
+	if len(d) < 12 || len(segs) == 0 {
+		return
+	}
+	cch := int(binary.LittleEndian.Uint16(d[10:]))
+	if cch == 0 {
+		return
+	}
+	r := newSegReader(segs)
+	flags, err := r.readByte()
+	if err != nil {
+		return
+	}
+	s, _ := r.readChars(cch, flags&0x01 != 0)
+	x.emitAux(s)
+}
+
+// emitAux writes a run of text that does not belong to the cell grid --
+// shape/text-box/comment text, a header or footer, a defined name, chart
+// text or a hyperlink -- on its own line so it does not run into the grid.
+func (x *xlsExtractor) emitAux(text string) {
+	text = cleanAuxText(text)
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	x.newline()
+	x.out.WriteString(text)
+	x.atLineStart = false
+	x.newline()
+	x.curRow = -1
+}
+
+// cleanAuxText keeps the printable content of non-cell text and turns the
+// in-text line breaks Excel uses (CR / LF / VT) into newlines.
+func cleanAuxText(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\r', '\n', 0x0B:
+			sb.WriteByte('\n')
+		case '\t':
+			sb.WriteByte('\t')
+		default:
+			if r >= 0x20 {
+				sb.WriteRune(r)
+			}
 		}
 	}
-	x.curRow = row
-	x.out.WriteString(text)
+	return strings.Trim(sb.String(), "\n")
+}
+
+// onHeaderFooter emits the text of a Header (0x0014) or Footer (0x0015)
+// record ([MS-XLS] 2.4.137 / 2.4.136). When no header/footer is set the
+// body is empty. The string carries page-setup format codes that
+// stripHeaderFooterCodes removes, leaving the literal text.
+func (x *xlsExtractor) onHeaderFooter(d []byte) {
+	if len(d) == 0 {
+		return
+	}
+	var s string
+	if x.biff5 {
+		// BIFF5: a byte-counted ANSI string (cch:1).
+		cch := int(d[0])
+		if 1+cch > len(d) {
+			return
+		}
+		s = latin1String(d[1 : 1+cch])
+	} else {
+		r := newSegReader([][]byte{d})
+		var err error
+		if s, err = readXLString(r, 2); err != nil && s == "" {
+			return
+		}
+	}
+	x.emitAux(stripHeaderFooterCodes(s))
+}
+
+// stripHeaderFooterCodes removes the page-setup formatting codes from a
+// header/footer string ([MS-XLS] 2.4.137): &L/&C/&R start the left/center/
+// right sections (rendered here as spaces), &"font,style" and &<digits> set
+// the font and size, && is a literal ampersand, &K<rrggbb> is a font color,
+// and every other &<letter> is a field code (page number, date, ...) that
+// carries no literal text.
+func stripHeaderFooterCodes(s string) string {
+	var sb strings.Builder
+	rs := []rune(s)
+	for i := 0; i < len(rs); i++ {
+		if rs[i] != '&' {
+			sb.WriteRune(rs[i])
+			continue
+		}
+		if i+1 >= len(rs) {
+			break
+		}
+		switch c := rs[i+1]; {
+		case c == '&':
+			sb.WriteRune('&')
+			i++
+		case c == '"': // &"font,style"
+			i += 2
+			for i < len(rs) && rs[i] != '"' {
+				i++
+			}
+		case c >= '0' && c <= '9': // &<digits>: font size
+			i++
+			for i+1 < len(rs) && rs[i+1] >= '0' && rs[i+1] <= '9' {
+				i++
+			}
+		case c == 'L' || c == 'C' || c == 'R': // section separators
+			sb.WriteByte(' ')
+			i++
+		case c == 'K': // &K<rrggbb>: font color
+			i++
+			for j := 0; j < 6 && i+1 < len(rs) && isHexDigit(rs[i+1]); j++ {
+				i++
+			}
+		default: // single-letter field code (&P, &D, &F, ...)
+			i++
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func isHexDigit(r rune) bool {
+	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+}
+
+// onLbl emits the name of a defined name (Lbl, [MS-XLS] 2.4.150). A 14-byte
+// fixed part (grbit, chKey, cch, cce, ...) is followed by the name string.
+// Built-in names (fBuiltin) are internal codes such as Print_Area and are
+// skipped.
+func (x *xlsExtractor) onLbl(d []byte) {
+	if len(d) < 15 {
+		return
+	}
+	grbit := binary.LittleEndian.Uint16(d[0:])
+	if grbit&0x0020 != 0 { // fBuiltin
+		return
+	}
+	cch := int(d[3])
+	if cch == 0 {
+		return
+	}
+	if x.biff5 {
+		if 14+cch <= len(d) {
+			x.emitAux(latin1String(d[14 : 14+cch]))
+		}
+		return
+	}
+	r := newSegReader([][]byte{d[14:]})
+	flags, err := r.readByte()
+	if err != nil {
+		return
+	}
+	if s, err := r.readChars(cch, flags&0x01 != 0); err == nil {
+		x.emitAux(s)
+	}
+}
+
+// onSeriesText emits a chart text string (SeriesText, [MS-XLS] 2.4.252): a
+// 2-byte unused id followed by a ShortXLUnicodeString (cch:1). These records
+// hold chart titles, axis titles and series/category names.
+func (x *xlsExtractor) onSeriesText(d []byte) {
+	if len(d) < 4 {
+		return
+	}
+	cch := int(d[2])
+	if cch == 0 {
+		return
+	}
+	r := newSegReader([][]byte{d[3:]})
+	flags, err := r.readByte()
+	if err != nil {
+		return
+	}
+	if s, err := r.readChars(cch, flags&0x01 != 0); err == nil {
+		x.emitAux(s)
+	}
+}
+
+// Hyperlink flag bits ([MS-OSHARED] 2.3.7.1).
+const (
+	hlinkHasMoniker      = 0x00000001
+	hlinkHasLocationStr  = 0x00000008
+	hlinkHasDisplayName  = 0x00000010
+	hlinkHasFrameName    = 0x00000080
+	hlinkMonikerAsString = 0x00000100
+)
+
+// urlMonikerCLSID is the URL Moniker class id
+// {79EAC9E0-BAF9-11CE-8C82-00AA004BA90B}, little-endian on the wire.
+var urlMonikerCLSID = [16]byte{
+	0xE0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11,
+	0x8C, 0x82, 0x00, 0xAA, 0x00, 0x4B, 0xA9, 0x0B,
+}
+
+// onHLink emits the display text and target of a hyperlink (HLink,
+// [MS-XLS] 2.4.323; the payload is a Hyperlink object, [MS-OSHARED]
+// 2.3.7.1). Layout: ref8(8) + CLSID(16) + streamVersion(4) + flags(4),
+// then the optional display name, target frame, moniker (the URL/path) and
+// location strings selected by the flags.
+func (x *xlsExtractor) onHLink(d []byte) {
+	pos := 8 + 16 + 4 // ref8 + hlinkClsid + streamVersion
+	if pos+4 > len(d) {
+		return
+	}
+	flags := binary.LittleEndian.Uint32(d[pos:])
+	pos += 4
+
+	var target, loc string
+	if flags&hlinkHasDisplayName != 0 {
+		// The display text is the cell's own visible text and is already
+		// emitted by the cell record, so it is read only to advance pos.
+		_, pos = readHyperlinkString(d, pos)
+	}
+	if flags&hlinkHasFrameName != 0 {
+		_, pos = readHyperlinkString(d, pos)
+	}
+	if flags&hlinkHasMoniker != 0 {
+		if flags&hlinkMonikerAsString != 0 {
+			target, pos = readHyperlinkString(d, pos)
+		} else if pos+16 <= len(d) {
+			isURL := isURLMoniker(d[pos : pos+16])
+			pos += 16
+			if isURL && pos+4 <= len(d) {
+				// URLMoniker ([MS-OSHARED] 2.3.7.2): a 4-byte byte length
+				// (including the terminating null) then a UTF-16LE URL.
+				nb := int(binary.LittleEndian.Uint32(d[pos:]))
+				pos += 4
+				if nb >= 2 && pos+nb <= len(d) {
+					target = strings.TrimRight(decodeUTF16(d[pos:pos+nb]), "\x00")
+					pos += nb
+				}
+			}
+		}
+	}
+	if flags&hlinkHasLocationStr != 0 {
+		loc, _ = readHyperlinkString(d, pos)
+	}
+	if loc != "" {
+		if target != "" {
+			target += "#" + loc
+		} else {
+			target = loc
+		}
+	}
+	x.emitAux(target)
+}
+
+// readHyperlinkString reads a HyperlinkString ([MS-OSHARED] 2.3.7.9): a
+// 4-byte character count (including the terminating null) followed by that
+// many UTF-16LE characters. It returns the string and the new offset.
+func readHyperlinkString(d []byte, pos int) (string, int) {
+	if pos+4 > len(d) {
+		return "", pos
+	}
+	n := int(binary.LittleEndian.Uint32(d[pos:]))
+	pos += 4
+	if n <= 0 || pos+2*n > len(d) {
+		return "", pos
+	}
+	s := strings.TrimRight(decodeUTF16(d[pos:pos+2*n]), "\x00")
+	return s, pos + 2*n
+}
+
+func isURLMoniker(b []byte) bool {
+	if len(b) < 16 {
+		return false
+	}
+	for i := 0; i < 16; i++ {
+		if b[i] != urlMonikerCLSID[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeUTF16 decodes a little-endian UTF-16 byte slice; a trailing odd
+// byte, if any, is ignored.
+func decodeUTF16(b []byte) string {
+	u := make([]uint16, len(b)/2)
+	for i := range u {
+		u[i] = binary.LittleEndian.Uint16(b[i*2:])
+	}
+	return string(utf16.Decode(u))
 }
 
 // decodeRK decodes an RkNumber ([MS-XLS] 2.5.276).

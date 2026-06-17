@@ -5,6 +5,28 @@
 //   - 2.5 The File Information Block (FIB); fcClx/lcbClx live in FibRgFcLcb97
 //   - 2.8.35 Clx, 2.8.36 Pcdt, 2.8.37 PlcPcd
 //   - 2.9.177 Pcd, 2.9.73 FcCompressed
+//
+// A .doc holds text in more places than the main body. 2.3 (Document
+// Parts) divides the document's character position (CP) range into
+// subdocuments laid out one after another, each sized by a field of
+// FibRgLw97 (2.5.4):
+//
+//	main document   (ccpText)     footnotes       (ccpFtn)
+//	headers/footers (ccpHdd)      comments        (ccpAtn)
+//	endnotes        (ccpEdn)      textboxes       (ccpTxbx)
+//	header textboxes (ccpHdrTxbx)
+//
+// Shape text lives in the textbox subdocument and is referenced from the
+// drawing layer via PlcftxbxTxt (2.8.21); comment text lives in the comment
+// (annotation) subdocument; and so on. The piece table (PlcPcd) maps every
+// CP in this whole range -- not just the CPs below ccpText -- to a file
+// offset, so decodePieceTable, which walks all pieces, already reproduces
+// every subdocument's text: body, footnotes, headers, comments, endnotes
+// and textbox/shape text are all extracted.
+//
+// They are emitted concatenated in CP (subdocument) order with no per-part
+// labels; the per-CP metadata that says which comment or footnote a run
+// belongs to (PlcfandTxt, the reference Plcfs, etc.) is not consulted.
 
 package oletext
 

@@ -70,6 +70,13 @@ func parseCFB(data []byte) (*cfbFile, error) {
 		miniCutoff: binary.LittleEndian.Uint32(data[56:]),
 	}
 
+	// A well-formed file has at most one FAT/DIFAT sector per stored sector,
+	// so the on-disk size caps how many of each can exist. The header counts
+	// are untrusted, so clamp to this bound to keep a corrupt file (e.g. a
+	// huge numDIFATSects with a cyclic DIFAT chain) from driving an
+	// effectively unbounded amount of work.
+	maxSects := len(data) / f.sectorSize
+
 	numFATSects := binary.LittleEndian.Uint32(data[44:])
 	firstDirSect := binary.LittleEndian.Uint32(data[48:])
 	firstMiniFATSect := binary.LittleEndian.Uint32(data[60:])
@@ -88,6 +95,9 @@ func parseCFB(data []byte) (*cfbFile, error) {
 	}
 	difatSect := firstDIFATSect
 	entriesPerDIFAT := f.sectorSize/4 - 1
+	if numDIFATSects > uint32(maxSects) {
+		numDIFATSects = uint32(maxSects)
+	}
 	for i := uint32(0); i < numDIFATSects && difatSect <= secMaxRegular; i++ {
 		sect, err := f.sectorData(difatSect)
 		if err != nil {
@@ -100,6 +110,9 @@ func parseCFB(data []byte) (*cfbFile, error) {
 			}
 		}
 		difatSect = binary.LittleEndian.Uint32(sect[entriesPerDIFAT*4:])
+	}
+	if numFATSects > uint32(maxSects) {
+		numFATSects = uint32(maxSects)
 	}
 	if uint32(len(fatSects)) < numFATSects {
 		// Tolerate header miscounts; use what we found.
