@@ -58,6 +58,20 @@ func TestXlsxPhonetic(t *testing.T) {
 	wantAbsent(t, got, "ナマエ")
 }
 
+// TestXlsxPhoneticInline checks the phonetic guide is also skipped inside an
+// inline string (<is>), which xlsxSheetText parses itself.
+func TestXlsxPhoneticInline(t *testing.T) {
+	workbook := `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>`
+	rels := `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>`
+	sheet := `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>名前</t><rPh sb="0" eb="2"><t>ナマエ</t></rPh></is></c></row></sheetData></worksheet>`
+	got := extractWant(t, zipBytes(map[string]string{
+		"xl/workbook.xml":            workbook,
+		"xl/_rels/workbook.xml.rels": rels,
+		"xl/worksheets/sheet1.xml":   sheet,
+	}), "名前")
+	wantAbsent(t, got, "ナマエ")
+}
+
 // TestXlsxThreadedComment checks the modern threaded-comment kind (text held
 // directly in <text>).
 func TestXlsxThreadedComment(t *testing.T) {
@@ -66,9 +80,9 @@ func TestXlsxThreadedComment(t *testing.T) {
 	sheet := `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>cell</t></is></c></row></sheetData></worksheet>`
 	threaded := `<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"><threadedComment ref="C3" id="{x}"><text>A threaded comment.</text></threadedComment></ThreadedComments>`
 	extractWant(t, zipBytes(map[string]string{
-		"xl/workbook.xml":            workbook,
-		"xl/_rels/workbook.xml.rels": rels,
-		"xl/worksheets/sheet1.xml":   sheet,
+		"xl/workbook.xml":                          workbook,
+		"xl/_rels/workbook.xml.rels":               rels,
+		"xl/worksheets/sheet1.xml":                 sheet,
 		"xl/threadedComments/threadedComment1.xml": threaded,
 	}), "cell", "A threaded comment.")
 }

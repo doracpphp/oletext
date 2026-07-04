@@ -16,12 +16,12 @@ func TestParseCFBBoundedDIFAT(t *testing.T) {
 	const sectorSize = 512
 	data := make([]byte, sectorSize*5) // header + 4 sectors -> maxSects == 5
 	copy(data, cfbSignature)
-	binary.LittleEndian.PutUint16(data[26:], 3)          // major version 3
-	binary.LittleEndian.PutUint16(data[30:], 9)          // 512-byte sectors
-	binary.LittleEndian.PutUint32(data[44:], 0xFFFFFFFA) // numFATSects (huge)
-	binary.LittleEndian.PutUint32(data[48:], 0)          // firstDirSect
-	binary.LittleEndian.PutUint32(data[68:], 0)          // firstDIFATSect -> sector 0
-	binary.LittleEndian.PutUint32(data[72:], 0xFFFFFFFA) // numDIFATSects (huge)
+	binary.LittleEndian.PutUint16(data[26:], 3)             // major version 3
+	binary.LittleEndian.PutUint16(data[30:], 9)             // 512-byte sectors
+	binary.LittleEndian.PutUint32(data[44:], 0xFFFFFFFA)    // numFATSects (huge)
+	binary.LittleEndian.PutUint32(data[48:], 0)             // firstDirSect
+	binary.LittleEndian.PutUint32(data[68:], 0)             // firstDIFATSect -> sector 0
+	binary.LittleEndian.PutUint32(data[72:], 0xFFFFFFFA)    // numDIFATSects (huge)
 	binary.LittleEndian.PutUint32(data[2*sectorSize-4:], 0) // DIFAT chain self-loop
 
 	done := make(chan struct{})

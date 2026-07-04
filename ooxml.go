@@ -444,6 +444,7 @@ func xlsxSheetText(zf *zip.File, sst []string) string {
 	var cell strings.Builder
 	cellType := ""
 	capture := false
+	skip := 0 // <rPh> phonetic-guide nesting depth (as in xlsxSharedStrings)
 	var hf strings.Builder
 	hfCapture := false
 	var hfLines []string
@@ -468,6 +469,8 @@ func xlsxSheetText(zf *zip.File, sst []string) string {
 				cell.Reset()
 			case "v", "t":
 				capture = true
+			case "rPh":
+				skip++
 			case "oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter":
 				hfCapture = true
 				hf.Reset()
@@ -476,6 +479,10 @@ func xlsxSheetText(zf *zip.File, sst []string) string {
 			switch t.Name.Local {
 			case "v", "t":
 				capture = false
+			case "rPh":
+				if skip > 0 {
+					skip--
+				}
 			case "c":
 				text := cell.String()
 				if cellType == "s" {
@@ -501,7 +508,7 @@ func xlsxSheetText(zf *zip.File, sst []string) string {
 				}
 			}
 		case xml.CharData:
-			if capture {
+			if capture && skip == 0 {
 				cell.Write(t)
 			} else if hfCapture {
 				hf.Write(t)
