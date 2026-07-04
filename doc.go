@@ -167,25 +167,37 @@ func decodePieceTable(plc, wd []byte) (string, error) {
 
 // cleanDocText maps Word's in-text control characters to plain text and
 // drops field codes (0x13 field begin / 0x14 separator / 0x15 end),
-// keeping only the field result.
+// keeping only the field result. Fields nest, and a field may have no
+// separator at all (index entries such as XE or TC are all code), so each
+// open field is tracked on a stack: an entry is true while that field's
+// code portion is still open, and inCode counts such entries.
 func cleanDocText(s string) string {
 	var sb strings.Builder
 	sb.Grow(len(s))
-	inFieldCode := 0
+	var fields []bool
+	inCode := 0
 	for _, r := range s {
 		switch r {
-		case 0x13: // field begin: skip until separator
-			inFieldCode++
+		case 0x13: // field begin: code portion follows
+			fields = append(fields, true)
+			inCode++
 			continue
 		case 0x14: // field separator: result text follows
-			if inFieldCode > 0 {
-				inFieldCode--
+			if n := len(fields); n > 0 && fields[n-1] {
+				fields[n-1] = false
+				inCode--
 			}
 			continue
 		case 0x15: // field end
+			if n := len(fields); n > 0 {
+				if fields[n-1] {
+					inCode--
+				}
+				fields = fields[:n-1]
+			}
 			continue
 		}
-		if inFieldCode > 0 {
+		if inCode > 0 {
 			continue
 		}
 		switch r {

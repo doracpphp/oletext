@@ -93,12 +93,7 @@ func extractXls(f *cfbFile) (string, error) {
 			x.onBoundSheet(r.data)
 		case recSST:
 			// Hand the SST record together with its Continue records.
-			segs := [][]byte{r.data}
-			for i+1 < len(recs) && recs[i+1].typ == recContinue {
-				i++
-				segs = append(segs, recs[i].data)
-			}
-			x.onSST(segs)
+			x.onSST(append([][]byte{r.data}, takeContinues(recs, &i)...))
 		case recLabelSst:
 			x.onLabelSst(r.data)
 		case recLabel, recRString:
@@ -115,12 +110,7 @@ func extractXls(f *cfbFile) (string, error) {
 			x.onString(r.data)
 		case recTxO:
 			// The shape/textbox/comment text follows in Continue records.
-			var segs [][]byte
-			for i+1 < len(recs) && recs[i+1].typ == recContinue {
-				i++
-				segs = append(segs, recs[i].data)
-			}
-			x.onTxO(r.data, segs)
+			x.onTxO(r.data, takeContinues(recs, &i))
 		case recHeader, recFooter:
 			x.onHeaderFooter(r.data)
 		case recLbl:
@@ -136,6 +126,17 @@ func extractXls(f *cfbFile) (string, error) {
 		out += "\n"
 	}
 	return out, nil
+}
+
+// takeContinues collects the Continue records immediately following
+// recs[*i], advancing *i past them.
+func takeContinues(recs []biffRecord, i *int) [][]byte {
+	var segs [][]byte
+	for *i+1 < len(recs) && recs[*i+1].typ == recContinue {
+		*i++
+		segs = append(segs, recs[*i].data)
+	}
+	return segs
 }
 
 // splitBiffRecords slices a BIFF stream into records, stopping at the
@@ -407,13 +408,21 @@ func (x *xlsExtractor) onTxO(d []byte, segs [][]byte) {
 	if cch == 0 {
 		return
 	}
+	// A truncated character array still yields its partial text.
+	s, _ := readFlaggedChars(segs, cch)
+	x.emitAux(s)
+}
+
+// readFlaggedChars reads an XLUnicodeStringNoCch whose length is known from
+// the enclosing record: an fHighByte flag byte followed by cch characters.
+// On error it returns the characters read so far along with the error.
+func readFlaggedChars(segs [][]byte, cch int) (string, error) {
 	r := newSegReader(segs)
 	flags, err := r.readByte()
 	if err != nil {
-		return
+		return "", err
 	}
-	s, _ := r.readChars(cch, flags&0x01 != 0)
-	x.emitAux(s)
+	return r.readChars(cch, flags&0x01 != 0)
 }
 
 // emitAux writes a run of text that does not belong to the cell grid --
@@ -549,12 +558,7 @@ func (x *xlsExtractor) onLbl(d []byte) {
 		}
 		return
 	}
-	r := newSegReader([][]byte{d[14:]})
-	flags, err := r.readByte()
-	if err != nil {
-		return
-	}
-	if s, err := r.readChars(cch, flags&0x01 != 0); err == nil {
+	if s, err := readFlaggedChars([][]byte{d[14:]}, cch); err == nil {
 		x.emitAux(s)
 	}
 }
@@ -570,12 +574,7 @@ func (x *xlsExtractor) onSeriesText(d []byte) {
 	if cch == 0 {
 		return
 	}
-	r := newSegReader([][]byte{d[3:]})
-	flags, err := r.readByte()
-	if err != nil {
-		return
-	}
-	if s, err := r.readChars(cch, flags&0x01 != 0); err == nil {
+	if s, err := readFlaggedChars([][]byte{d[3:]}, cch); err == nil {
 		x.emitAux(s)
 	}
 }
@@ -618,25 +617,33 @@ func (x *xlsExtractor) onHLink(d []byte) {
 	if flags&hlinkHasFrameName != 0 {
 		_, pos = readHyperlinkString(d, pos)
 	}
+	monikerOK := true // false once pos no longer tracks the moniker's end
 	if flags&hlinkHasMoniker != 0 {
 		if flags&hlinkMonikerAsString != 0 {
 			target, pos = readHyperlinkString(d, pos)
-		} else if pos+16 <= len(d) {
-			isURL := isURLMoniker(d[pos : pos+16])
-			pos += 16
-			if isURL && pos+4 <= len(d) {
-				// URLMoniker ([MS-OSHARED] 2.3.7.2): a 4-byte byte length
-				// (including the terminating null) then a UTF-16LE URL.
-				nb := int(binary.LittleEndian.Uint32(d[pos:]))
-				pos += 4
-				if nb >= 2 && pos+nb <= len(d) {
-					target = strings.TrimRight(decodeUTF16(d[pos:pos+nb]), "\x00")
-					pos += nb
+		} else {
+			// Only the URL moniker is parsed; any other kind (e.g. the
+			// composite/file moniker of a local-file link) has an unknown
+			// length, so nothing after it can be located reliably.
+			monikerOK = false
+			if pos+16 <= len(d) {
+				isURL := isURLMoniker(d[pos : pos+16])
+				pos += 16
+				if isURL && pos+4 <= len(d) {
+					// URLMoniker ([MS-OSHARED] 2.3.7.2): a 4-byte byte length
+					// (including the terminating null) then a UTF-16LE URL.
+					nb := int(binary.LittleEndian.Uint32(d[pos:]))
+					pos += 4
+					if nb >= 2 && pos+nb <= len(d) {
+						target = strings.TrimRight(decodeUTF16(d[pos:pos+nb]), "\x00")
+						pos += nb
+						monikerOK = true
+					}
 				}
 			}
 		}
 	}
-	if flags&hlinkHasLocationStr != 0 {
+	if monikerOK && flags&hlinkHasLocationStr != 0 {
 		loc, _ = readHyperlinkString(d, pos)
 	}
 	if loc != "" {
