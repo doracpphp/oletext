@@ -69,6 +69,14 @@ text, err := oletext.Extract(data)
 - Word 95 and earlier are not supported. BIFF5 (`.xls`) byte strings are
   decoded as Latin-1; Word 97+/BIFF8/PPT 97+ and all OOXML formats store text
   as Unicode, so non-Latin scripts work there.
+- VBA source is stored in the project's ANSI code page. Windows-1252 and
+  UTF-8 are decoded; for any other code page (e.g. 932, Shift_JIS) the ASCII
+  part of the source is kept and each other character becomes U+FFFD, because
+  decoding it needs conversion tables the standard library does not have.
+- Text of embedded OLE objects (e.g. a Word document embedded in a workbook)
+  is not extracted; only the containing document is.
+- Tracked deletions, and the origin of tracked moves, are left out of `.docx`
+  output.
 - Extraction is intentionally thorough: PowerPoint output can include slide
   master/layout placeholder prompts (e.g. "Click to edit Master title
   style"), and Word output concatenates all subdocuments (body, footnotes,

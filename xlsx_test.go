@@ -117,3 +117,16 @@ func TestXlsxHeaderFooterCodes(t *testing.T) {
 	}), "grid cell", "LeftHead", "CenterHead", "RightHead", "Confidential")
 	wantAbsent(t, got, "&L", "&C", "&14", "Arial")
 }
+
+// TestXlsxBoolean checks a boolean cell (t="b") reads as TRUE/FALSE rather
+// than the stored 1/0.
+func TestXlsxBoolean(t *testing.T) {
+	workbook := `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>`
+	rels := `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>`
+	sheet := `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="b"><v>1</v></c><c r="B1" t="b"><v>0</v></c><c r="C1"><v>1</v></c></row></sheetData></worksheet>`
+	extractWant(t, zipBytes(map[string]string{
+		"xl/workbook.xml":            workbook,
+		"xl/_rels/workbook.xml.rels": rels,
+		"xl/worksheets/sheet1.xml":   sheet,
+	}), "TRUE\tFALSE\t1")
+}

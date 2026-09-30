@@ -121,66 +121,97 @@ func vbaUTF16(s string) []byte {
 	return b.Bytes()
 }
 
-// buildVBADir builds a decompressed dir stream describing a single module in
-// the record layout parseVBADir expects.
-func buildVBADir(streamName string, offset int) []byte {
+// vbaTestModule describes one module for buildVBADir.
+type vbaTestModule struct {
+	name   string // MODULENAME and MODULESTREAMNAME
+	offset int    // MODULEOFFSET: where the compressed source starts
+}
+
+// buildVBADir builds a decompressed dir stream in the [MS-OVBA] 2.3.4.2
+// layout: a PROJECTINFORMATION section reduced to PROJECTSYSKIND and
+// PROJECTCODEPAGE, then PROJECTMODULES, PROJECTCOOKIE and one MODULE record
+// per module. The MODULE and dir terminators are an Id followed by 4
+// reserved zero bytes, which is exactly a record with Size=0.
+func buildVBADir(codePage uint16, mods ...vbaTestModule) []byte {
+	le := binary.LittleEndian
 	var b bytes.Buffer
-	// PROJECTMODULES: Id(0x000F), Size=2, Count=1.
-	binary.Write(&b, binary.LittleEndian, uint16(0x000F))
-	binary.Write(&b, binary.LittleEndian, uint32(2))
-	binary.Write(&b, binary.LittleEndian, uint16(1))
-
-	vbaRec(&b, 0x0019, []byte(streamName)) // MODULENAME
-	vbaRec(&b, 0x001A, []byte(streamName)) // MODULESTREAMNAME
-	off := make([]byte, 4)
-	binary.LittleEndian.PutUint32(off, uint32(offset))
-	vbaRec(&b, 0x0031, off) // MODULEOFFSET
-
-	// MODULE terminator: Id(0x002B), Size=0, plus 4 reserved bytes.
-	binary.Write(&b, binary.LittleEndian, uint16(0x002B))
-	binary.Write(&b, binary.LittleEndian, uint32(0))
-	b.Write([]byte{0, 0, 0, 0})
-
-	// dir terminator: Id(0x0010), Size=0.
-	binary.Write(&b, binary.LittleEndian, uint16(0x0010))
-	binary.Write(&b, binary.LittleEndian, uint32(0))
+	vbaRec(&b, 0x0001, []byte{1, 0, 0, 0})                      // PROJECTSYSKIND
+	vbaRec(&b, 0x0003, le.AppendUint16(nil, codePage))          // PROJECTCODEPAGE
+	vbaRec(&b, 0x000F, le.AppendUint16(nil, uint16(len(mods)))) // PROJECTMODULES
+	vbaRec(&b, 0x0013, []byte{0xFF, 0xFF})                      // PROJECTCOOKIE
+	for _, m := range mods {
+		vbaRec(&b, 0x0019, []byte(m.name))                         // MODULENAME
+		vbaRec(&b, 0x001A, []byte(m.name))                         // MODULESTREAMNAME
+		vbaRec(&b, 0x0031, le.AppendUint32(nil, uint32(m.offset))) // MODULEOFFSET
+		vbaRec(&b, 0x0021, nil)                                    // MODULETYPE (procedural)
+		vbaRec(&b, 0x002B, nil)                                    // MODULE terminator
+	}
+	vbaRec(&b, 0x0010, nil) // dir terminator
 	return b.Bytes()
 }
 
 // ---- minimal CFB writer ----
 
 // buildCFB writes a minimal [MS-CFB] version-3 compound file holding the
-// given named streams (plus the required Root Entry). MiniCutoff is set to 0
-// so every stream lives in the regular FAT, avoiding the mini stream and
-// letting readChain return each stream at its exact size.
+// given streams (plus the required Root Entry). A name containing "/" puts
+// the stream inside storages, e.g. "MBD0001/WordDocument"; the storages are
+// created as needed and every storage's children are linked into a sibling
+// tree. MiniCutoff is set to 0 so every stream lives in the regular FAT,
+// avoiding the mini stream and letting readChain return each stream at its
+// exact size.
 func buildCFB(streams map[string][]byte) []byte {
 	const (
 		ss         = 512
 		endOfChain = 0xFFFFFFFE
 		freeSect   = 0xFFFFFFFF
 		fatSect    = 0xFFFFFFFD
+		noStream   = 0xFFFFFFFF
 	)
-	names := make([]string, 0, len(streams))
+	paths := make([]string, 0, len(streams))
 	for n := range streams {
-		names = append(names, n)
+		paths = append(paths, n)
 	}
-	sort.Strings(names)
+	sort.Strings(paths)
 
 	type entry struct {
-		name  string
-		data  []byte
-		start uint32
-		nsect int
+		name     string
+		objType  byte
+		data     []byte
+		start    uint32
+		nsect    int
+		children []int
 	}
-	ents := make([]entry, len(names))
-	next := 2 // sector 0 = FAT, sector 1 = directory
-	for i, n := range names {
-		d := streams[n]
-		ns := (len(d) + ss - 1) / ss
+	ents := []entry{{name: "Root Entry", objType: 5, start: endOfChain}}
+	storages := map[string]int{"": 0}
+	for _, p := range paths {
+		parent, dir := 0, ""
+		segs := strings.Split(p, "/")
+		for _, seg := range segs[:len(segs)-1] {
+			dir += seg + "/"
+			id, ok := storages[dir]
+			if !ok {
+				id = len(ents)
+				ents = append(ents, entry{name: seg, objType: 1})
+				ents[parent].children = append(ents[parent].children, id)
+				storages[dir] = id
+			}
+			parent = id
+		}
+		ents[parent].children = append(ents[parent].children, len(ents))
+		ents = append(ents, entry{name: segs[len(segs)-1], objType: 2, data: streams[p]})
+	}
+
+	dirSects := (len(ents)*128 + ss - 1) / ss
+	next := 1 + dirSects // sector 0 = FAT, then the directory
+	for i := range ents {
+		if ents[i].objType != 2 {
+			continue
+		}
+		ns := (len(ents[i].data) + ss - 1) / ss
 		if ns == 0 {
 			ns = 1
 		}
-		ents[i] = entry{n, d, uint32(next), ns}
+		ents[i].start, ents[i].nsect = uint32(next), ns
 		next += ns
 	}
 	total := next
@@ -189,16 +220,17 @@ func buildCFB(streams map[string][]byte) []byte {
 	for i := range fat {
 		fat[i] = freeSect
 	}
+	chain := func(start, n int) {
+		for k := 0; k < n-1; k++ {
+			fat[start+k] = uint32(start + k + 1)
+		}
+		fat[start+n-1] = endOfChain
+	}
 	fat[0] = fatSect
-	fat[1] = endOfChain // directory: one sector
+	chain(1, dirSects)
 	for _, e := range ents {
-		for k := 0; k < e.nsect; k++ {
-			s := int(e.start) + k
-			if k == e.nsect-1 {
-				fat[s] = endOfChain
-			} else {
-				fat[s] = uint32(s + 1)
-			}
+		if e.objType == 2 {
+			chain(int(e.start), e.nsect)
 		}
 	}
 
@@ -223,20 +255,44 @@ func buildCFB(streams map[string][]byte) []byte {
 		le.PutUint32(buf[ss+i*4:], v)
 	}
 
-	dirOff := ss * 2 // directory sector (sector 1)
-	writeDirEntry(buf[dirOff:], "Root Entry", 5, endOfChain, 0)
+	dirOff := ss * 2 // the directory starts at sector 1
+	for i := dirSects * ss / 128; i > len(ents); i-- {
+		// Unallocated slots of the last directory sector.
+		writeDirEntry(buf[dirOff+(i-1)*128:], "", 0, 0, 0)
+	}
 	for i, e := range ents {
-		writeDirEntry(buf[dirOff+(i+1)*128:], e.name, 2, e.start, uint64(len(e.data)))
+		writeDirEntry(buf[dirOff+i*128:], e.name, e.objType, e.start, uint64(len(e.data)))
+	}
+	// Link the children as a degenerate tree: the storage points at its
+	// first child and each child at the next one as its right sibling.
+	for i, e := range ents {
+		for k, c := range e.children {
+			if k == 0 {
+				le.PutUint32(buf[dirOff+i*128+76:], uint32(c))
+			}
+			if k+1 < len(e.children) {
+				le.PutUint32(buf[dirOff+c*128+72:], uint32(e.children[k+1]))
+			}
+		}
 	}
 	for _, e := range ents {
-		copy(buf[ss*(int(e.start)+1):], e.data)
+		if e.objType == 2 {
+			copy(buf[ss*(int(e.start)+1):], e.data)
+		}
 	}
 	return buf
 }
 
-// writeDirEntry fills a 128-byte [MS-CFB] directory entry.
+// writeDirEntry fills a 128-byte [MS-CFB] directory entry with no sibling or
+// child links. An empty name writes an unallocated entry.
 func writeDirEntry(b []byte, name string, objType byte, start uint32, size uint64) {
 	le := binary.LittleEndian
+	le.PutUint32(b[68:], 0xFFFFFFFF)
+	le.PutUint32(b[72:], 0xFFFFFFFF)
+	le.PutUint32(b[76:], 0xFFFFFFFF)
+	if name == "" {
+		return
+	}
 	u := utf16.Encode([]rune(name))
 	for i, c := range u {
 		le.PutUint16(b[i*2:], c)
@@ -244,9 +300,6 @@ func writeDirEntry(b []byte, name string, objType byte, start uint32, size uint6
 	le.PutUint16(b[64:], uint16((len(u)+1)*2)) // name length incl. terminator
 	b[66] = objType
 	b[67] = 1 // color = black
-	le.PutUint32(b[68:], 0xFFFFFFFF)
-	le.PutUint32(b[72:], 0xFFFFFFFF)
-	le.PutUint32(b[76:], 0xFFFFFFFF)
 	le.PutUint32(b[116:], start)
 	le.PutUint64(b[120:], size)
 }

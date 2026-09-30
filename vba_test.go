@@ -59,8 +59,7 @@ func TestParseVBADir(t *testing.T) {
 	vbaRec(&b, vbaIDStreamNameUni, vbaUTF16("Macro1"))      // stream name (Unicode)
 	vbaRec(&b, vbaIDModuleOffset, []byte{0x00, 0x02, 0, 0}) // TextOffset = 512
 	vbaRec(&b, 0x0021, nil)                                 // MODULETYPE
-	vbaRec(&b, vbaIDModuleTerm, nil)                        // terminator...
-	b.Write([]byte{0, 0, 0, 0})                             // ...+ 4 reserved bytes
+	vbaRec(&b, vbaIDModuleTerm, nil)                        // terminator + 4 reserved bytes
 	vbaRec(&b, vbaIDDirTerm, nil)                           // dir terminator
 
 	mods := parseVBADir(b.Bytes())
@@ -79,7 +78,7 @@ func TestExtractVBADirect(t *testing.T) {
 	source := "Attribute VB_Name = \"Module1\"\r\nSub Hello()\r\n    MsgBox \"こんにちは マクロ\"\r\nEnd Sub\r\n"
 	const cacheLen = 100
 	module := append(make([]byte, cacheLen), compressVBALiteral([]byte(source))...)
-	dir := compressVBALiteral(buildVBADir("Module1", cacheLen))
+	dir := compressVBALiteral(buildVBADir(0, vbaTestModule{"Module1", cacheLen}))
 
 	f, err := parseCFB(buildCFB(map[string][]byte{"dir": dir, "Module1": module}))
 	if err != nil {
@@ -96,6 +95,82 @@ func TestExtractVBADirect(t *testing.T) {
 	wantAbsent(t, got, "\r") // CRLF normalized to LF
 }
 
+// vbaModuleStream builds a module stream: cacheLen bytes of PerformanceCache
+// followed by the compressed source.
+func vbaModuleStream(cacheLen int, source []byte) []byte {
+	return append(make([]byte, cacheLen), compressVBALiteral(source)...)
+}
+
+// TestExtractVBAAllModules checks every module of a project is extracted,
+// not just the first: the MODULE terminator is 6 bytes (Id + 4 reserved), so
+// the next module's records follow it immediately.
+func TestExtractVBAAllModules(t *testing.T) {
+	dir := buildVBADir(1252,
+		vbaTestModule{"ThisWorkbook", 3},
+		vbaTestModule{"Sheet1", 5},
+		vbaTestModule{"Module1", 7},
+	)
+	if mods := parseVBADir(dir); len(mods) != 3 || mods[2].streamName != "Module1" || mods[2].textOffset != 7 {
+		t.Fatalf("parseVBADir = %+v, want 3 modules ending with {Module1 Module1 7}", mods)
+	}
+	f, err := parseCFB(buildCFB(map[string][]byte{
+		"VBA/dir":          compressVBALiteral(dir),
+		"VBA/ThisWorkbook": vbaModuleStream(3, []byte("Sub WorkbookOpen()\r\nEnd Sub\r\n")),
+		"VBA/Sheet1":       vbaModuleStream(5, []byte("Sub SheetChange()\r\nEnd Sub\r\n")),
+		"VBA/Module1":      vbaModuleStream(7, []byte("Sub Hello()\r\nEnd Sub\r\n")),
+	}))
+	if err != nil {
+		t.Fatalf("parseCFB: %v", err)
+	}
+	got := extractVBA(f)
+	wantContains(t, got,
+		"=== VBA Module: ThisWorkbook ===", "Sub WorkbookOpen()",
+		"=== VBA Module: Sheet1 ===", "Sub SheetChange()",
+		"=== VBA Module: Module1 ===", "Sub Hello()",
+	)
+}
+
+// TestExtractVBAModuleScopedToProject checks a module stream is taken from
+// the storage holding the project's dir stream, not from a same-named
+// stream elsewhere in the file.
+func TestExtractVBAModuleScopedToProject(t *testing.T) {
+	dir := buildVBADir(1252, vbaTestModule{"Module1", 0})
+	f, err := parseCFB(buildCFB(map[string][]byte{
+		"Other/Module1":      vbaModuleStream(0, []byte("Sub Wrong()\r\n")),
+		"Macros/VBA/dir":     compressVBALiteral(dir),
+		"Macros/VBA/Module1": vbaModuleStream(0, []byte("Sub Right()\r\n")),
+	}))
+	if err != nil {
+		t.Fatalf("parseCFB: %v", err)
+	}
+	got := extractVBA(f)
+	wantContains(t, got, "Sub Right()")
+	wantAbsent(t, got, "Sub Wrong()")
+}
+
+// TestDecodeCodePage checks module source always comes out as valid UTF-8:
+// Windows-1252 is decoded, and text in a code page that cannot be decoded
+// keeps its ASCII with one U+FFFD per undecodable character.
+func TestDecodeCodePage(t *testing.T) {
+	for _, tc := range []struct {
+		in       string
+		codePage int
+		want     string
+	}{
+		{"MsgBox \"ok\"", 932, "MsgBox \"ok\""},
+		{"caf\xE9 \x80", 1252, "café €"},
+		{"caf\xE9", 0, "café"},
+		{"' \x82\xA0\x82\xA2 x", 932, "' �� x"}, // two double-byte characters
+		{"' \xB1\xB2", 932, "' ｱｲ"},             // half-width katakana
+		{"' \xCF\xF0", 1251, "' ��"},
+		{"こんにちは", 65001, "こんにちは"},
+	} {
+		if got := decodeCodePage([]byte(tc.in), tc.codePage); got != tc.want {
+			t.Errorf("decodeCodePage(%q, %d) = %q, want %q", tc.in, tc.codePage, got, tc.want)
+		}
+	}
+}
+
 // TestExtractXlsmMacro builds a genuine macro-enabled workbook (a real
 // vbaProject.bin embedded in an .xlsx ZIP) and checks the VBA source comes
 // out through Extract alongside the ordinary sheet text.
@@ -106,7 +181,7 @@ func TestExtractXlsmMacro(t *testing.T) {
 		"End Sub\r\n"
 	const cacheLen = 10
 	module := append(make([]byte, cacheLen), compressVBALiteral([]byte(source))...)
-	dir := compressVBALiteral(buildVBADir("Module1", cacheLen))
+	dir := compressVBALiteral(buildVBADir(0, vbaTestModule{"Module1", cacheLen}))
 	vbaBin := buildCFB(map[string][]byte{"dir": dir, "Module1": module})
 
 	workbook := `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>`

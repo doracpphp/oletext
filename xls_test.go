@@ -1,6 +1,7 @@
 package oletext
 
 import (
+	"bytes"
 	"encoding/binary"
 	"strings"
 	"testing"
@@ -21,6 +22,49 @@ func TestXlsBodyAndShape(t *testing.T) {
 // a string long enough to span Continue records.
 func TestXlsLarge(t *testing.T) {
 	verifyBig(t, "testdata/big.xls", 30000, `和\d{6}`, []string{"LONGSTART", "LONGEND_MK"})
+}
+
+// biffRec appends one BIFF record (type, size, payload) to b.
+func biffRec(b *bytes.Buffer, typ uint16, data []byte) {
+	binary.Write(b, binary.LittleEndian, typ)
+	binary.Write(b, binary.LittleEndian, uint16(len(data)))
+	b.Write(data)
+}
+
+// minimalWorkbook builds a BIFF8 Workbook stream with one sheet "S" whose
+// cell A1 holds text, followed by any extra sheet records.
+func minimalWorkbook(text string, extra ...func(*bytes.Buffer)) []byte {
+	var b bytes.Buffer
+	biffRec(&b, recBOF, []byte{0x00, 0x06, 0x05, 0x00}) // BIFF8, workbook globals
+	biffRec(&b, recBoundSheet, []byte{0, 0, 0, 0, 0, 0, 1, 0, 'S'})
+	biffRec(&b, recEOF, nil)
+	biffRec(&b, recBOF, []byte{0x00, 0x06, 0x10, 0x00})      // BIFF8, worksheet
+	label := []byte{0, 0, 0, 0, 0, 0, byte(len(text)), 0, 0} // row, col, ixfe, cch, flags
+	biffRec(&b, recLabel, append(label, text...))
+	for _, fn := range extra {
+		fn(&b)
+	}
+	biffRec(&b, recEOF, nil)
+	return b.Bytes()
+}
+
+// TestXlsBoolAndError checks boolean and error cells are emitted, both as
+// BoolErr records and as cached formula results.
+func TestXlsBoolAndError(t *testing.T) {
+	wb := minimalWorkbook("Label", func(b *bytes.Buffer) {
+		biffRec(b, recBoolErr, []byte{1, 0, 0, 0, 0, 0, 1, 0})    // row 1: TRUE
+		biffRec(b, recBoolErr, []byte{1, 0, 1, 0, 0, 0, 0x07, 1}) // row 1: #DIV/0!
+		formula := make([]byte, 20)
+		formula[0] = 2                        // row 2
+		formula[6], formula[8] = 0x01, 0      // boolean FALSE
+		formula[12], formula[13] = 0xFF, 0xFF // non-numeric result
+		biffRec(b, recFormula, formula)
+		formula[2] = 1                      // next column
+		formula[6], formula[8] = 0x02, 0x2A // error #N/A
+		biffRec(b, recFormula, formula)
+	})
+	extractWant(t, buildCFB(map[string][]byte{"Workbook": wb}),
+		"Label\nTRUE\t#DIV/0!\nFALSE\t#N/A\n")
 }
 
 // hlinkPayload builds an HLink record body: ref8 + hlinkClsid +

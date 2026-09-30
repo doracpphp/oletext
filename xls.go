@@ -6,7 +6,8 @@
 //     the continued part starts with a fresh fHighByte flag byte)
 //   - 2.5.293 XLUnicodeRichExtendedString, 2.5.294 XLUnicodeString
 //   - 2.4.149 LabelSst, 2.4.148 Label, 2.4.180 Number, 2.4.220 RK,
-//     2.4.175 MulRk, 2.4.127 Formula, 2.4.268 String, 2.4.28 BoundSheet8
+//     2.4.175 MulRk, 2.4.127 Formula, 2.4.268 String, 2.4.28 BoundSheet8,
+//     2.4.24 BoolErr
 //   - 2.4.324 TxO (text of shapes, text boxes and cell comments; the text
 //     itself is stored in the Continue records that follow the TxO)
 //
@@ -48,6 +49,7 @@ const (
 	recLabelSst   = 0x00FD
 	recLabel      = 0x0204
 	recNumber     = 0x0203
+	recBoolErr    = 0x0205
 	recString     = 0x0207
 	recRK         = 0x027E
 	recBOF        = 0x0809
@@ -100,6 +102,8 @@ func extractXls(f *cfbFile) (string, error) {
 			x.onLabel(r.data)
 		case recNumber:
 			x.onNumber(r.data)
+		case recBoolErr:
+			x.onBoolErr(r.data)
 		case recRK:
 			x.onRK(r.data)
 		case recMulRk:
@@ -306,6 +310,44 @@ func (x *xlsExtractor) onNumber(d []byte) {
 	x.emitCell(row, formatNum(v))
 }
 
+// onBoolErr emits a cell holding a boolean or an error value:
+// cell(6) bBoolErr(1) fError(1).
+func (x *xlsExtractor) onBoolErr(d []byte) {
+	if len(d) < 8 {
+		return
+	}
+	row := int(binary.LittleEndian.Uint16(d[0:]))
+	x.emitCell(row, formatBoolErr(d[6], d[7] != 0))
+}
+
+// formatBoolErr renders a boolean or, when isErr is set, an error code
+// ([MS-XLS] 2.5.10 Bes) the way Excel displays it.
+func formatBoolErr(v byte, isErr bool) string {
+	if !isErr {
+		if v != 0 {
+			return "TRUE"
+		}
+		return "FALSE"
+	}
+	switch v {
+	case 0x00:
+		return "#NULL!"
+	case 0x07:
+		return "#DIV/0!"
+	case 0x0F:
+		return "#VALUE!"
+	case 0x17:
+		return "#REF!"
+	case 0x1D:
+		return "#NAME?"
+	case 0x24:
+		return "#NUM!"
+	case 0x2A:
+		return "#N/A"
+	}
+	return ""
+}
+
 // onRK emits a cell holding an RK-encoded number.
 func (x *xlsExtractor) onRK(d []byte) {
 	if len(d) < 10 {
@@ -331,18 +373,22 @@ func (x *xlsExtractor) onMulRk(d []byte) {
 
 // onFormula emits a formula's cached value. Layout: cell(6) +
 // CachedValue(8) + flags... If the last two bytes of CachedValue are
-// 0xFFFF the value is non-numeric; a leading byte of 0x00 means a string
-// result carried by the following String record ([MS-XLS] 2.5.133
-// FormulaValue).
+// 0xFFFF the value is non-numeric and its first byte gives the kind
+// ([MS-XLS] 2.5.133 FormulaValue): 0x00 is a string result carried by the
+// following String record, 0x01 a boolean and 0x02 an error, both held in
+// the third byte.
 func (x *xlsExtractor) onFormula(d []byte) {
 	if len(d) < 14 {
 		return
 	}
 	row := int(binary.LittleEndian.Uint16(d[0:]))
 	if binary.LittleEndian.Uint16(d[12:]) == 0xFFFF {
-		if d[6] == 0x00 {
+		switch d[6] {
+		case 0x00:
 			x.pendingStringRow = row
 			x.hasPendingString = true
+		case 0x01, 0x02:
+			x.emitCell(row, formatBoolErr(d[8], d[6] == 0x02))
 		}
 		return
 	}

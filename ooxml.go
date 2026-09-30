@@ -326,17 +326,21 @@ func corePropertiesText(zf *zip.File) string {
 	return strings.Join(parts, "\n")
 }
 
+// maxVBAPart caps how much of a vbaProject.bin part is decompressed into
+// memory, so a ZIP entry crafted to inflate without bound is not read whole.
+const maxVBAPart = 256 << 20
+
 // readPartBytes returns the full decompressed contents of a ZIP part, or
-// nil if it is missing or unreadable. Used only for the small binary
-// vbaProject.bin part, which needs random access.
+// nil if it is missing, unreadable or larger than maxVBAPart. Used only for
+// the small binary vbaProject.bin part, which needs random access.
 func readPartBytes(zf *zip.File) []byte {
 	rc := openPart(zf)
 	if rc == nil {
 		return nil
 	}
 	defer rc.Close()
-	data, err := io.ReadAll(rc)
-	if err != nil {
+	data, err := io.ReadAll(io.LimitReader(rc, maxVBAPart+1))
+	if err != nil || len(data) > maxVBAPart {
 		return nil
 	}
 	return data
@@ -428,8 +432,9 @@ func xlsxSharedStrings(zf *zip.File) []string {
 }
 
 // xlsxSheetText extracts the non-empty cells of a worksheet. A cell's text
-// comes from its <v> element (a number, formula-string result, or a shared
-// string index when t="s") or from <is><t> when t="inlineStr". The print
+// comes from its <v> element (a number, formula-string result, a shared
+// string index when t="s", or a boolean when t="b") or from <is><t> when
+// t="inlineStr". The print
 // header/footer text in <headerFooter> (whose &L/&C/&R section codes are
 // stripped) is appended after the cell grid.
 func xlsxSheetText(zf *zip.File, sst []string) string {
@@ -485,11 +490,19 @@ func xlsxSheetText(zf *zip.File, sst []string) string {
 				}
 			case "c":
 				text := cell.String()
-				if cellType == "s" {
+				switch cellType {
+				case "s":
 					if idx, err := strconv.Atoi(strings.TrimSpace(text)); err == nil && idx >= 0 && idx < len(sst) {
 						text = sst[idx]
 					} else {
 						text = ""
+					}
+				case "b":
+					switch strings.TrimSpace(text) {
+					case "1":
+						text = "TRUE"
+					case "0":
+						text = "FALSE"
 					}
 				}
 				if text != "" {
@@ -527,9 +540,15 @@ func xlsxSheetText(zf *zip.File, sst []string) string {
 // extractXMLText streams a WordprocessingML/DrawingML part and pulls out
 // its running text. By default the text-bearing elements are <w:t>/<a:t>;
 // extra local names (such as "text" for comment parts) can be added. A
-// <w:p>/<a:p> ends a paragraph, <w:tab> becomes a tab and <w:br>/<w:cr> a
-// newline. The <mc:Fallback> branch of an mc:AlternateContent block is
-// skipped so its content is not emitted twice (once per alternative).
+// <w:p>/<a:p> ends a paragraph, <w:tab>/<w:ptab> becomes a tab and
+// <w:br>/<w:cr> a newline.
+//
+// Three subtrees are skipped: the <mc:Fallback> branch of an
+// mc:AlternateContent block, so its content is not emitted twice (once per
+// alternative); the tab-stop definitions in <w:tabs>/<a:tabLst>, whose
+// <w:tab>/<a:tab> children describe paragraph formatting rather than a tab
+// character; and <w:moveFrom>, the tracked-change copy of text at the place
+// it was moved away from (like deleted text, which is <w:delText>).
 func extractXMLText(r io.Reader, textTags ...string) string {
 	capTag := map[string]bool{"t": true}
 	for _, tg := range textTags {
@@ -553,17 +572,19 @@ func extractXMLText(r io.Reader, textTags ...string) string {
 			if skipAt >= 0 {
 				continue
 			}
-			switch {
-			case t.Name.Local == "Fallback":
+			switch name := t.Name.Local; {
+			case name == "Fallback", name == "tabs", name == "tabLst", name == "moveFrom":
 				skipAt = depth
-			case capTag[t.Name.Local]:
+			case capTag[name]:
 				if capAt < 0 {
 					capAt = depth
 				}
-			case t.Name.Local == "tab":
+			case name == "tab", name == "ptab":
 				sb.WriteByte('\t')
-			case t.Name.Local == "br", t.Name.Local == "cr":
+			case name == "br", name == "cr":
 				sb.WriteByte('\n')
+			case name == "noBreakHyphen":
+				sb.WriteByte('-')
 			}
 		case xml.EndElement:
 			if skipAt >= 0 {

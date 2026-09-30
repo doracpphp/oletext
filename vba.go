@@ -9,28 +9,31 @@
 //     of the source, starting at MODULEOFFSET)
 //   - 2.4.1 Compression and Decompression (the run-length/copy-token codec)
 //
-// The compound file is parsed with a flat directory ([cfbFile]), so the dir
-// and module streams are located by name rather than by walking the storage
-// tree. That is enough: a file has a single VBA project and its module
-// stream names are unique.
+// A project is found by its dir stream, wherever its "VBA" storage sits
+// (Macros/VBA in Word, _VBA_PROJECT_CUR/VBA in Excel, the root VBA storage
+// of a vbaProject.bin); its module streams are looked up in that same
+// storage.
 
 package oletext
 
 import (
 	"encoding/binary"
 	"strings"
+	"unicode/utf8"
 )
 
 // dir stream record ids ([MS-OVBA] 2.3.4.2) used here.
 const (
-	vbaIDProjectModules = 0x000F // PROJECTMODULES (Count follows)
-	vbaIDModuleName     = 0x0019 // MODULENAME (MBCS)
-	vbaIDModuleNameUni  = 0x0047 // MODULENAMEUNICODE
-	vbaIDStreamName     = 0x001A // MODULESTREAMNAME (MBCS)
-	vbaIDStreamNameUni  = 0x0032 // MODULESTREAMNAME unicode (reserved record)
-	vbaIDModuleOffset   = 0x0031 // MODULEOFFSET (TextOffset)
-	vbaIDModuleTerm     = 0x002B // MODULE terminator (followed by 4 reserved bytes)
-	vbaIDDirTerm        = 0x0010 // dir stream terminator
+	vbaIDProjectCodePage = 0x0003 // PROJECTCODEPAGE
+	vbaIDProjectModules  = 0x000F // PROJECTMODULES (Count follows)
+	vbaIDProjectCookie   = 0x0013 // PROJECTCOOKIE (follows PROJECTMODULES)
+	vbaIDModuleName      = 0x0019 // MODULENAME (MBCS)
+	vbaIDModuleNameUni   = 0x0047 // MODULENAMEUNICODE
+	vbaIDStreamName      = 0x001A // MODULESTREAMNAME (MBCS)
+	vbaIDStreamNameUni   = 0x0032 // MODULESTREAMNAME unicode (reserved record)
+	vbaIDModuleOffset    = 0x0031 // MODULEOFFSET (TextOffset)
+	vbaIDModuleTerm      = 0x002B // MODULE terminator (4 reserved zero bytes follow)
+	vbaIDDirTerm         = 0x0010 // dir stream terminator
 )
 
 // vbaModule is one entry from the dir stream: where the module's source is.
@@ -40,52 +43,118 @@ type vbaModule struct {
 	textOffset int    // byte offset of the CompressedContainer of the source
 }
 
-// extractVBA returns the source code of any VBA macro project in the
+// extractVBA returns the source code of every VBA macro project in the
 // compound file, or "" if there is none. Modules are emitted in dir order,
 // each under a "=== VBA Module: <name> ===" header.
 func extractVBA(f *cfbFile) string {
-	dirRaw, err := f.openStream("dir")
-	if err != nil || len(dirRaw) == 0 {
-		return ""
-	}
-	dir := decompressVBA(dirRaw)
-	if len(dir) == 0 {
-		return ""
-	}
-	modules := parseVBADir(dir)
-	if len(modules) == 0 {
-		return ""
-	}
-
 	var b strings.Builder
-	for _, m := range modules {
-		stream, err := f.openStream(m.streamName)
-		if err != nil || m.textOffset < 0 || m.textOffset > len(stream) {
+	for id, e := range f.dirs {
+		if e.objType != objStream || e.name != "dir" {
 			continue
 		}
-		src := normalizeVBA(string(decompressVBA(stream[m.textOffset:])))
-		if strings.TrimSpace(src) == "" {
+		dirRaw, err := f.readStream(id)
+		if err != nil || len(dirRaw) == 0 {
 			continue
 		}
-		name := m.name
-		if name == "" {
-			name = m.streamName
-		}
-		b.WriteString("=== VBA Module: ")
-		b.WriteString(name)
-		b.WriteString(" ===\n")
-		b.WriteString(src)
-		if !strings.HasSuffix(src, "\n") {
-			b.WriteByte('\n')
+		dir := decompressVBA(dirRaw)
+		codePage := vbaCodePage(dir)
+		for _, m := range parseVBADir(dir) {
+			stream, err := f.openStreamIn(e.parent, m.streamName)
+			if err != nil || m.textOffset < 0 || m.textOffset > len(stream) {
+				continue
+			}
+			src := normalizeVBA(decodeCodePage(decompressVBA(stream[m.textOffset:]), codePage))
+			if strings.TrimSpace(src) == "" {
+				continue
+			}
+			name := m.name
+			if name == "" {
+				name = m.streamName
+			}
+			b.WriteString("=== VBA Module: ")
+			b.WriteString(name)
+			b.WriteString(" ===\n")
+			b.WriteString(src)
+			if !strings.HasSuffix(src, "\n") {
+				b.WriteByte('\n')
+			}
 		}
 	}
 	return b.String()
 }
 
+// vbaCodePage returns the PROJECTCODEPAGE of a decompressed dir stream: the
+// code page the module source (and the MBCS names) are stored in. The record
+// sits in the PROJECTINFORMATION section at the start of the stream, where
+// every record before it has the plain Id+Size+Data layout. It returns 0
+// when the record is missing.
+func vbaCodePage(dir []byte) int {
+	pos := 0
+	for pos+6 <= len(dir) {
+		id := binary.LittleEndian.Uint16(dir[pos:])
+		size := int(binary.LittleEndian.Uint32(dir[pos+2:]))
+		pos += 6
+		if size < 0 || pos+size > len(dir) || id == vbaIDProjectModules {
+			break
+		}
+		if id == vbaIDProjectCodePage && size >= 2 {
+			return int(binary.LittleEndian.Uint16(dir[pos:]))
+		}
+		pos += size
+	}
+	return 0
+}
+
+// decodeCodePage converts text stored in a Windows code page to UTF-8.
+// Text that is already valid UTF-8 (which covers plain ASCII and code page
+// 65001) is returned unchanged. Otherwise Windows-1252 is decoded exactly;
+// for any other code page only the ASCII range can be decoded without a
+// conversion table, so each non-ASCII character becomes U+FFFD rather than
+// leaking undecodable bytes into the UTF-8 output.
+func decodeCodePage(b []byte, codePage int) string {
+	if utf8.Valid(b) {
+		return string(b)
+	}
+	var sb strings.Builder
+	sb.Grow(len(b))
+	switch codePage {
+	case 0, 1252:
+		for _, c := range b {
+			sb.WriteRune(cp1252ToRune(c))
+		}
+	case 932, 936, 949, 950: // double-byte: a lead byte and its trail byte are one character
+		for i := 0; i < len(b); i++ {
+			c := b[i]
+			switch {
+			case c < 0x80:
+				sb.WriteByte(c)
+			case codePage == 932 && c >= 0xA1 && c <= 0xDF: // half-width katakana
+				sb.WriteRune(0xFF61 + rune(c-0xA1))
+			default:
+				sb.WriteRune(utf8.RuneError)
+				if i+1 < len(b) && b[i+1] >= 0x40 { // trail byte
+					i++
+				}
+			}
+		}
+	default:
+		for _, c := range b {
+			if c < 0x80 {
+				sb.WriteByte(c)
+			} else {
+				sb.WriteRune(utf8.RuneError)
+			}
+		}
+	}
+	return sb.String()
+}
+
 // parseVBADir reads the module table from a decompressed dir stream. It
-// skips ahead to PROJECTMODULES because the preceding PROJECTREFERENCES
-// section contains REFERENCECONTROL records that do not follow the plain
-// Id+Size+Data record layout; from PROJECTMODULES on, every record does.
+// skips ahead to PROJECTMODULES because the preceding PROJECTINFORMATION
+// and PROJECTREFERENCES sections contain records that do not follow the
+// plain Id+Size+Data record layout; from PROJECTMODULES on, every record
+// does. (The MODULE and dir terminators are an Id followed by 4 reserved
+// zero bytes, which read as a record of size 0.)
 func parseVBADir(dir []byte) []vbaModule {
 	start := indexProjectModules(dir)
 	if start < 0 {
@@ -127,9 +196,6 @@ func parseVBADir(dir []byte) []vbaModule {
 				cur.textOffset = int(binary.LittleEndian.Uint32(data))
 			}
 		case vbaIDModuleTerm:
-			// The terminator is followed by 4 reserved bytes that are not a
-			// record; skip them so the next module stays aligned.
-			pos += 4
 			if cur.streamName != "" {
 				mods = append(mods, cur)
 			}
@@ -148,15 +214,26 @@ func parseVBADir(dir []byte) []vbaModule {
 }
 
 // indexProjectModules finds the PROJECTMODULES record, identified by its id
-// (0x000F) and fixed 2-byte size.
+// (0x000F) and fixed 2-byte size. The same six bytes can occur by chance in
+// the reference records before it, so a match followed by the PROJECTCOOKIE
+// record the spec puts next is preferred over a bare first match.
 func indexProjectModules(dir []byte) int {
+	first := -1
 	for i := 0; i+6 <= len(dir); i++ {
-		if binary.LittleEndian.Uint16(dir[i:]) == vbaIDProjectModules &&
-			binary.LittleEndian.Uint32(dir[i+2:]) == 2 {
+		if binary.LittleEndian.Uint16(dir[i:]) != vbaIDProjectModules ||
+			binary.LittleEndian.Uint32(dir[i+2:]) != 2 {
+			continue
+		}
+		if i+14 <= len(dir) &&
+			binary.LittleEndian.Uint16(dir[i+8:]) == vbaIDProjectCookie &&
+			binary.LittleEndian.Uint32(dir[i+10:]) == 2 {
 			return i
 		}
+		if first < 0 {
+			first = i
+		}
 	}
-	return -1
+	return first
 }
 
 // normalizeVBA converts the CRLF line endings of VBA source to '\n' and

@@ -35,3 +35,36 @@ func TestParseCFBBoundedDIFAT(t *testing.T) {
 		t.Fatal("parseCFB did not return within 2s on a corrupt DIFAT count")
 	}
 }
+
+// TestStreamLookupScopedToRoot checks the document type is decided by the
+// streams of the root storage. An embedded OLE object keeps its own streams
+// in a sub-storage under the same well-known names, so a workbook with an
+// embedded Word document must still be read as a workbook.
+func TestStreamLookupScopedToRoot(t *testing.T) {
+	data := buildCFB(map[string][]byte{
+		"MBD0001/WordDocument": []byte("not a real FIB"),
+		"Workbook":             minimalWorkbook("Sheet text"),
+	})
+	f, err := parseCFB(data)
+	if err != nil {
+		t.Fatalf("parseCFB: %v", err)
+	}
+	if f.hasStream("WordDocument") {
+		t.Error("hasStream found the embedded object's WordDocument stream in the root storage")
+	}
+	if !f.hasStream("workbook") {
+		t.Error("hasStream should match the root Workbook stream case-insensitively")
+	}
+	extractWant(t, data, "=== Sheet: S ===", "Sheet text")
+}
+
+// TestReadChainLoop checks a cyclic FAT chain is reported as an error rather
+// than followed indefinitely.
+func TestReadChainLoop(t *testing.T) {
+	data := buildCFB(map[string][]byte{"A": make([]byte, 600)})
+	// Layout: sector 0 = FAT, 1 = directory, 2-3 = stream A.
+	binary.LittleEndian.PutUint32(data[512+1*4:], 1) // FAT[1] -> 1: the directory chain loops
+	if _, err := parseCFB(data); err == nil {
+		t.Error("expected an error for a looping directory chain, got nil")
+	}
+}

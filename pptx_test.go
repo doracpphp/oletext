@@ -41,3 +41,19 @@ func TestPptxSlideComment(t *testing.T) {
 		"ppt/comments/comment1.xml":       comment,
 	}), "Slide body.", "A slide comment.")
 }
+
+// TestPptxTabStops checks the tab-stop definitions of a paragraph
+// (<a:tabLst>) do not come out as tab characters.
+func TestPptxTabStops(t *testing.T) {
+	pres := `<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>`
+	rels := `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>`
+	slide := `<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:pPr><a:tabLst><a:tab pos="914400" algn="l"/><a:tab pos="1828800" algn="l"/></a:tabLst></a:pPr><a:r><a:t>Tabbed body.</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`
+	got := extractWant(t, zipBytes(map[string]string{
+		"ppt/presentation.xml":            pres,
+		"ppt/_rels/presentation.xml.rels": rels,
+		"ppt/slides/slide1.xml":           slide,
+	}))
+	if want := "Tabbed body.\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

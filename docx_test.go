@@ -36,6 +36,22 @@ func TestDocxProperties(t *testing.T) {
 	)
 }
 
+// TestDocxTabStopsAndMoves checks that tab-stop definitions (<w:tabs>) do
+// not come out as tab characters while a real <w:tab/> does, and that the
+// origin of a tracked move (<w:moveFrom>) is not extracted a second time.
+func TestDocxTabStopsAndMoves(t *testing.T) {
+	doc := `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` +
+		`<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/><w:tab w:val="right" w:pos="9000"/></w:tabs></w:pPr>` +
+		`<w:r><w:t>Left</w:t><w:tab/><w:t>Right</w:t></w:r></w:p>` +
+		`<w:p><w:moveFrom><w:r><w:t>Moved sentence.</w:t></w:r></w:moveFrom></w:p>` +
+		`<w:p><w:moveTo><w:r><w:t>Moved sentence.</w:t></w:r></w:moveTo></w:p>` +
+		`</w:body></w:document>`
+	got := extractWant(t, zipBytes(map[string]string{"word/document.xml": doc}))
+	if want := "Left\tRight\n\nMoved sentence.\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // TestDocxChart covers chart title/label text (DrawingML <a:t> inside a
 // chart part).
 func TestDocxChart(t *testing.T) {

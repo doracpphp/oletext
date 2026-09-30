@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf16"
 )
 
@@ -26,14 +27,29 @@ const (
 	secFree       = 0xFFFFFFFF // FREESECT
 )
 
+// Directory entry object types ([MS-CFB] 2.6.1).
+const (
+	objStorage = 1
+	objStream  = 2
+	objRoot    = 5
+)
+
 var cfbSignature = []byte{0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1}
 
 // dirEntry is a parsed directory entry ([MS-CFB] 2.6.1, 128 bytes each).
+// Its index in cfbFile.dirs is its stream id; unallocated entries are kept
+// (with objType 0) so that the ids stay valid.
 type dirEntry struct {
 	name      string
-	objType   byte // 0=unknown 1=storage 2=stream 5=root
+	objType   byte // 0=unallocated 1=storage 2=stream 5=root
 	startSect uint32
 	size      uint64
+	// left, right and child are the stream ids linking the entry into its
+	// storage's red-black tree of siblings and to its first child.
+	left, right, child uint32
+	// parent is the id of the storage holding this entry (0 = root storage),
+	// or -1 for the root entry and unallocated entries.
+	parent int
 }
 
 // cfbFile is a parsed compound file ready for stream lookups.
@@ -120,6 +136,7 @@ func parseCFB(data []byte) (*cfbFile, error) {
 	}
 
 	// FAT ([MS-CFB] 2.4): concatenation of all FAT sectors.
+	f.fat = make([]uint32, 0, int(numFATSects)*(f.sectorSize/4))
 	for _, s := range fatSects[:numFATSects] {
 		sect, err := f.sectorData(s)
 		if err != nil {
@@ -138,7 +155,9 @@ func parseCFB(data []byte) (*cfbFile, error) {
 	for off := 0; off+128 <= len(dirData); off += 128 {
 		e := dirData[off : off+128]
 		nameLen := int(binary.LittleEndian.Uint16(e[64:]))
-		if nameLen < 2 || nameLen > 64 {
+		objType := e[66]
+		if nameLen < 2 || nameLen > 64 || (objType != objStorage && objType != objStream && objType != objRoot) {
+			f.dirs = append(f.dirs, dirEntry{parent: -1}) // unallocated slot
 			continue
 		}
 		u := make([]uint16, (nameLen-2)/2)
@@ -147,14 +166,19 @@ func parseCFB(data []byte) (*cfbFile, error) {
 		}
 		f.dirs = append(f.dirs, dirEntry{
 			name:      string(utf16.Decode(u)),
-			objType:   e[66],
+			objType:   objType,
 			startSect: binary.LittleEndian.Uint32(e[116:]),
 			size:      binary.LittleEndian.Uint64(e[120:]),
+			left:      binary.LittleEndian.Uint32(e[68:]),
+			right:     binary.LittleEndian.Uint32(e[72:]),
+			child:     binary.LittleEndian.Uint32(e[76:]),
+			parent:    -1,
 		})
 	}
-	if len(f.dirs) == 0 || f.dirs[0].objType != 5 {
+	if len(f.dirs) == 0 || f.dirs[0].objType != objRoot {
 		return nil, errors.New("missing root directory entry")
 	}
+	f.linkDirTree()
 	if major == 3 {
 		// [MS-CFB] 2.6.1: in version 3 files only the low 32 bits of the
 		// stream size are meaningful.
@@ -189,12 +213,62 @@ func (f *cfbFile) sectorData(sect uint32) ([]byte, error) {
 	return f.data[off : off+int64(f.sectorSize)], nil
 }
 
-// readChain follows a FAT sector chain. size==0 reads the whole chain.
+// linkDirTree resolves every directory entry's parent storage by walking
+// the sibling trees ([MS-CFB] 2.6.4) down from the root entry. Streams of an
+// embedded OLE object live in a sub-storage and reuse the well-known names
+// (an .xls with an embedded Word document has a nested "WordDocument"), so
+// lookups must be scoped to a storage rather than match by name alone.
+//
+// An allocated entry the walk does not reach (a damaged tree) is treated as
+// a child of the root storage so its stream stays reachable.
+func (f *cfbFile) linkDirTree() {
+	seen := make([]bool, len(f.dirs))
+	seen[0] = true
+	type item struct {
+		id     uint32
+		parent int
+	}
+	stack := []item{{f.dirs[0].child, 0}}
+	for len(stack) > 0 {
+		it := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if it.id >= uint32(len(f.dirs)) || seen[it.id] { // NOSTREAM, corrupt id or cycle
+			continue
+		}
+		seen[it.id] = true
+		e := &f.dirs[it.id]
+		if e.objType == 0 {
+			continue
+		}
+		e.parent = it.parent
+		stack = append(stack, item{e.left, it.parent}, item{e.right, it.parent})
+		if e.objType == objStorage {
+			stack = append(stack, item{e.child, int(it.id)})
+		}
+	}
+	for i := 1; i < len(f.dirs); i++ {
+		if e := &f.dirs[i]; e.objType != 0 && e.parent < 0 {
+			e.parent = 0
+		}
+	}
+}
+
+// readChain follows a FAT sector chain. size==0 reads the whole chain;
+// otherwise reading stops once size bytes are available.
 func (f *cfbFile) readChain(start uint32, size uint64) ([]byte, error) {
-	var out []byte
+	if size > uint64(len(f.data)) {
+		return nil, fmt.Errorf("stream truncated: want %d bytes, file has %d", size, len(f.data))
+	}
+	// A chain cannot visit more sectors than the file holds, which bounds
+	// both the loop and the output even when the FAT is corrupt or cyclic.
+	maxSteps := len(f.data) / f.sectorSize
+	out := make([]byte, 0, size)
 	sect := start
 	for steps := 0; sect <= secMaxRegular; steps++ {
-		if steps > len(f.fat) {
+		if size > 0 && uint64(len(out)) >= size {
+			break
+		}
+		if steps >= maxSteps {
 			return nil, errors.New("FAT chain loop detected")
 		}
 		d, err := f.sectorData(sect)
@@ -220,20 +294,23 @@ func (f *cfbFile) readChain(start uint32, size uint64) ([]byte, error) {
 // (64-byte mini sectors, [MS-CFB] 2.8).
 func (f *cfbFile) readMiniChain(start uint32, size uint64) ([]byte, error) {
 	const miniSize = 64
-	var out []byte
+	if size > uint64(len(f.miniStream)) {
+		return nil, fmt.Errorf("mini stream truncated: want %d bytes, mini stream has %d", size, len(f.miniStream))
+	}
+	out := make([]byte, 0, size)
 	sect := start
-	for steps := 0; sect <= secMaxRegular; steps++ {
+	for steps := 0; sect <= secMaxRegular && uint64(len(out)) < size; steps++ {
 		if steps > len(f.miniFAT) {
 			return nil, errors.New("mini FAT chain loop detected")
+		}
+		if sect >= uint32(len(f.miniFAT)) {
+			return nil, fmt.Errorf("mini sector %d beyond mini FAT", sect)
 		}
 		off := int(sect) * miniSize
 		if off+miniSize > len(f.miniStream) {
 			return nil, fmt.Errorf("mini sector %d out of range", sect)
 		}
 		out = append(out, f.miniStream[off:off+miniSize]...)
-		if sect >= uint32(len(f.miniFAT)) {
-			return nil, fmt.Errorf("mini sector %d beyond mini FAT", sect)
-		}
 		sect = f.miniFAT[sect]
 	}
 	if uint64(len(out)) < size {
@@ -242,39 +319,58 @@ func (f *cfbFile) readMiniChain(start uint32, size uint64) ([]byte, error) {
 	return out[:size], nil
 }
 
-// openStream returns the contents of the named stream anywhere in the
-// directory. Streams smaller than the mini stream cutoff (normally 4096
-// bytes) live in the mini stream ([MS-CFB] 2.6.1).
+// findStream returns the id of the stream called name directly inside the
+// storage with id parent (0 = the root storage), or -1. Names compare
+// case-insensitively ([MS-CFB] 2.6.4).
+func (f *cfbFile) findStream(parent int, name string) int {
+	for i, e := range f.dirs {
+		if e.objType == objStream && e.parent == parent && strings.EqualFold(e.name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// readStream returns the contents of the stream with the given id. Streams
+// smaller than the mini stream cutoff (normally 4096 bytes) live in the
+// mini stream ([MS-CFB] 2.6.1).
+func (f *cfbFile) readStream(id int) ([]byte, error) {
+	e := f.dirs[id]
+	if e.size == 0 {
+		return nil, nil
+	}
+	if e.size < uint64(f.miniCutoff) {
+		return f.readMiniChain(e.startSect, e.size)
+	}
+	return f.readChain(e.startSect, e.size)
+}
+
+// openStreamIn returns the contents of the named stream directly inside the
+// storage with id parent.
+func (f *cfbFile) openStreamIn(parent int, name string) ([]byte, error) {
+	id := f.findStream(parent, name)
+	if id < 0 {
+		return nil, fmt.Errorf("stream %q not found", name)
+	}
+	return f.readStream(id)
+}
+
+// openStream returns the contents of the named stream of the root storage.
 func (f *cfbFile) openStream(name string) ([]byte, error) {
-	for _, e := range f.dirs {
-		if e.objType == 2 && e.name == name {
-			if e.size == 0 {
-				return nil, nil
-			}
-			if e.size < uint64(f.miniCutoff) {
-				return f.readMiniChain(e.startSect, e.size)
-			}
-			return f.readChain(e.startSect, e.size)
-		}
-	}
-	return nil, fmt.Errorf("stream %q not found", name)
+	return f.openStreamIn(0, name)
 }
 
-// hasStream reports whether a stream with the given name exists.
+// hasStream reports whether the root storage holds a stream with the given
+// name.
 func (f *cfbFile) hasStream(name string) bool {
-	for _, e := range f.dirs {
-		if e.objType == 2 && e.name == name {
-			return true
-		}
-	}
-	return false
+	return f.findStream(0, name) >= 0
 }
 
-// streamNames lists the names of all streams in the file.
+// streamNames lists the names of the streams in the root storage.
 func (f *cfbFile) streamNames() []string {
 	var names []string
 	for _, e := range f.dirs {
-		if e.objType == 2 {
+		if e.objType == objStream && e.parent == 0 {
 			names = append(names, e.name)
 		}
 	}

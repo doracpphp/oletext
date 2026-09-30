@@ -82,7 +82,10 @@ func FuzzDecodePieceTable(f *testing.F) {
 	f.Add([]byte{}, []byte{})
 	f.Add([]byte{0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, []byte("hello world"))
 	f.Fuzz(func(t *testing.T, plc, wd []byte) {
-		_, _ = decodePieceTable(plc, wd)
+		_, _ = decodePieceTable(plc, wd, nil)
+		_, _ = decodePieceTable(plc, wd, map[uint32]bool{1: true, 2: true, 4: true})
+		_ = papxGrpprl(wd, len(plc))
+		_ = grpprlHasTtp(wd, func() []byte { return plc })
 	})
 }
 
@@ -103,6 +106,7 @@ func FuzzXlsHandlers(f *testing.F) {
 			x.onLabel(d)
 			x.onNumber(d)
 			x.onRK(d)
+			x.onBoolErr(d)
 			x.onMulRk(d)
 			x.onFormula(d)
 			x.onString(d)
